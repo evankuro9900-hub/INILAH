@@ -47,19 +47,70 @@ TEAM_TOKEN_STOPWORDS = {
     "sad",
     "sc",
     "sd",
+    "united",
 }
 
 
 def normalize_team_name(name: str) -> str:
-    ascii_name = (
-        unicodedata.normalize("NFKD", name)
-        .encode("ascii", "ignore")
-        .decode("ascii")
-        .lower()
-    )
-    ascii_name = re.sub(r"[^a-z0-9]+", " ", ascii_name)
-    tokens = [token for token in ascii_name.split() if token not in TEAM_TOKEN_STOPWORDS]
+    ascii_name = _ascii_slug(name)
+    tokens = _significant_tokens(ascii_name)
     return " ".join(tokens) or ascii_name.strip()
+
+
+def _ascii_slug(name: str) -> str:
+    ascii_name = (
+        unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
+    )
+    return re.sub(r"[^a-z0-9]+", " ", ascii_name).strip()
+
+
+def _significant_tokens(name: str) -> list[str]:
+    return [token for token in name.split() if token not in TEAM_TOKEN_STOPWORDS]
+
+
+def find_normalized_team_key(team_name: str, candidates: set[str]) -> str | None:
+    normalized = normalize_team_name(team_name)
+    if normalized in candidates:
+        return normalized
+
+    query_tokens = set(normalized.split())
+    if not query_tokens:
+        return None
+
+    substring_matches = [
+        candidate for candidate in candidates if normalized in candidate or candidate in normalized
+    ]
+    if len(substring_matches) == 1:
+        return substring_matches[0]
+
+    subset_matches = [
+        candidate
+        for candidate in candidates
+        if query_tokens <= set(candidate.split()) or set(candidate.split()) <= query_tokens
+    ]
+    if len(subset_matches) == 1:
+        return subset_matches[0]
+
+    overlap_matches = [
+        candidate
+        for candidate in candidates
+        if len(query_tokens & set(candidate.split()))
+        == min(len(query_tokens), len(set(candidate.split())))
+    ]
+    if len(overlap_matches) == 1:
+        return overlap_matches[0]
+
+    query_token_list = sorted(query_tokens, key=len, reverse=True)
+    shared_token_matches = [
+        candidate
+        for candidate in candidates
+        if len(query_token_list[0]) >= 4
+        and any(query_token_list[0] in candidate_token for candidate_token in candidate.split())
+    ]
+    if len(shared_token_matches) == 1:
+        return shared_token_matches[0]
+
+    return None
 
 
 async def fetch_multi_league_snapshot() -> dict[str, dict[str, object]]:
@@ -117,11 +168,7 @@ def build_team_index(league_data: dict[str, object] | None) -> dict[str, dict[st
 def find_team_stats(
     team_name: str, team_index: dict[str, dict[str, object]]
 ) -> dict[str, object] | None:
-    normalized = normalize_team_name(team_name)
-    if normalized in team_index:
-        return team_index[normalized]
-
-    for indexed_name, stats in team_index.items():
-        if normalized and (normalized in indexed_name or indexed_name in normalized):
-            return stats
-    return None
+    key = find_normalized_team_key(team_name, set(team_index))
+    if key is None:
+        return None
+    return team_index[key]

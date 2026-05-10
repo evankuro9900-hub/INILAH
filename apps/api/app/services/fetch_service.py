@@ -24,6 +24,7 @@ from app.services.scrapers.espn import EspnFixture, fetch_all_leagues_fixtures
 from app.services.scrapers.multi_league import (
     build_team_index,
     fetch_multi_league_snapshot,
+    find_normalized_team_key,
     normalize_team_name,
 )
 from app.services.skill_engine import generate_pick
@@ -226,8 +227,10 @@ async def _generate_picks_for_date(db: AsyncSession, target_date: date) -> None:
             continue
 
         league_stats = stats_by_league.get(fx.league_id, {})
-        home_stats = league_stats.get(normalize_team_name(fx.home_team))
-        away_stats = league_stats.get(normalize_team_name(fx.away_team))
+        home_key = find_normalized_team_key(fx.home_team, set(league_stats))
+        away_key = find_normalized_team_key(fx.away_team, set(league_stats))
+        home_stats = league_stats[home_key] if home_key is not None else None
+        away_stats = league_stats[away_key] if away_key is not None else None
 
         pick = generate_pick(
             league=league,
@@ -254,7 +257,10 @@ async def _generate_picks_for_date(db: AsyncSession, target_date: date) -> None:
             edge_pct=pick.edge,
             stake_pct=pick.stake_pct,
             scoring_card=pick.scoring_card.to_dict(),
-            reasoning={"reasons": pick.reasoning, "candidates": [c.to_dict() for c in pick.candidates[:6]]},
+            reasoning={
+                "reasons": pick.reasoning,
+                "candidates": [c.to_dict() for c in pick.candidates[:6]],
+            },
             tags=pick.tags,
             skill_version=settings.skill_version,
         )
