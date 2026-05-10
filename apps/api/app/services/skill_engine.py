@@ -19,7 +19,6 @@ from typing import Any
 
 from app.leagues import League
 
-
 # ─── Konstanta tier threshold ───
 TIER_MIN_EDGE = {
     "T1": 0.05,
@@ -208,6 +207,22 @@ def estimate_rp_for_market(market: str, base_home_rp: float, score_adjustment: f
     return 0.5  # fallback
 
 
+def _normalize_form_result(result: str) -> str | None:
+    normalized = result.strip().upper()
+    if normalized in {"W", "D", "L"}:
+        return normalized
+    return None
+
+
+def _normalize_form(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        result = _normalize_form_result(value)
+        if result is not None:
+            normalized.append(result)
+    return normalized
+
+
 # ─── Pre-flight checks ───
 
 
@@ -245,16 +260,21 @@ def generate_pick(
     is_cup_knockout: bool = False,
     is_friendly: bool = False,
     odds_overrides: dict[str, float] | None = None,
+    home_team_stats: dict[str, object] | None = None,
+    away_team_stats: dict[str, object] | None = None,
 ) -> GeneratedPick | None:
     """Generate pick untuk satu match.
 
     Returns None kalau pre-flight check skip atau tidak ada market +EV.
     """
-    home_form = home_form or []
-    away_form = away_form or []
+    home_form = _normalize_form(home_form)
+    away_form = _normalize_form(away_form)
 
     # Step 0: Pre-flight
-    tags, skip = check_pre_flight(len(home_form), len(away_form), is_cup_knockout, is_friendly)
+    has_team_stats = home_team_stats is not None and away_team_stats is not None
+    home_sample_count = len(home_form) if home_form else (8 if has_team_stats else 0)
+    away_sample_count = len(away_form) if away_form else (8 if has_team_stats else 0)
+    tags, skip = check_pre_flight(home_sample_count, away_sample_count, is_cup_knockout, is_friendly)
     if skip:
         return None
 
@@ -266,8 +286,12 @@ def generate_pick(
         away_position=away_position,
         league_size=league_size,
         is_cup_knockout=is_cup_knockout,
+        home_team_stats=home_team_stats,
+        away_team_stats=away_team_stats,
     )
     card.tags = tags
+    if has_team_stats:
+        card.tags.append("MULTI_LEAGUE_STATS")
     if "LOW_DATA" in tags:
         card.notes.append("Sample data 5–8 match — confidence diturunkan")
 
@@ -324,7 +348,7 @@ def generate_pick(
     stake = half_kelly_capped(best.estimated_rp, best.odds)
 
     # Step 7: Reasoning ringkas
-    reasoning = _build_reasoning(card, base_home_rp, home_position, away_position, league_size)
+    reasoning = _build_reasoning(card, base_home_rp, home_position, away_position)
 
     return GeneratedPick(
         market=best.market,
@@ -347,6 +371,8 @@ def _compute_scoring(
     away_position: int | None,
     league_size: int,
     is_cup_knockout: bool,
+    home_team_stats: dict[str, object] | None = None,
+    away_team_stats: dict[str, object] | None = None,
 ) -> ScoringCard:
     """Hitung scoring card v3.0 (simplified untuk MVP)."""
     card = ScoringCard()
@@ -378,18 +404,19 @@ def _compute_scoring(
     # Position diff (proxy untuk strength)
     if home_position is not None and away_position is not None:
         gap = away_position - home_position  # positif = home lebih atas
+        scaled_gap = gap * (20 / max(league_size, 1))
         # Map gap ke score
-        if gap >= 10:
+        if scaled_gap >= 10:
             pos_score = 2.5
-        elif gap >= 6:
+        elif scaled_gap >= 6:
             pos_score = 1.5
-        elif gap >= 3:
+        elif scaled_gap >= 3:
             pos_score = 0.8
-        elif gap >= -2:
+        elif scaled_gap >= -2:
             pos_score = 0.0
-        elif gap >= -5:
+        elif scaled_gap >= -5:
             pos_score = -0.8
-        elif gap >= -9:
+        elif scaled_gap >= -9:
             pos_score = -1.5
         else:
             pos_score = -2.5
@@ -401,11 +428,68 @@ def _compute_scoring(
     # Home advantage default
     card.home_away = 0.5
 
+    stat_score = _stats_strength_score(home_team_stats, away_team_stats)
+    if stat_score is not None:
+        card.xg_xga = max(-3.0, min(3.0, (card.xg_xga * 0.35) + (stat_score * 0.65)))
+        card.notes.append("Team stats dari multi-league analytics dipakai")
+
     # Cup knockout: turunkan confidence
     if is_cup_knockout:
         card.notes.append("Cup knockout — variance tinggi")
 
     return card
+
+
+def _float_stat(stats: dict[str, object] | None, key: str) -> float | None:
+    if stats is None:
+        return None
+    value = stats.get(key)
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float, str)):
+            return float(value)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _stats_strength_score(
+    home_team_stats: dict[str, object] | None, away_team_stats: dict[str, object] | None
+) -> float | None:
+    score = 0.0
+    signals = 0
+
+    home_xgd = _float_stat(home_team_stats, "xg_diff")
+    away_xgd = _float_stat(away_team_stats, "xg_diff")
+    if home_xgd is not None and away_xgd is not None:
+        score += max(-2.5, min(2.5, (home_xgd - away_xgd) / 12.0))
+        signals += 1
+
+    home_rating = _float_stat(home_team_stats, "rating")
+    away_rating = _float_stat(away_team_stats, "rating")
+    if home_rating is not None and away_rating is not None:
+        score += max(-1.5, min(1.5, (home_rating - away_rating) * 5.0))
+        signals += 1
+
+    home_gpm = _float_stat(home_team_stats, "goals_per_match")
+    away_gapm = _float_stat(away_team_stats, "goals_conceded_per_match")
+    away_gpm = _float_stat(away_team_stats, "goals_per_match")
+    home_gapm = _float_stat(home_team_stats, "goals_conceded_per_match")
+    if (
+        home_gpm is not None
+        and away_gapm is not None
+        and away_gpm is not None
+        and home_gapm is not None
+    ):
+        home_attack_edge = home_gpm - away_gapm
+        away_attack_edge = away_gpm - home_gapm
+        score += max(-1.5, min(1.5, home_attack_edge - away_attack_edge))
+        signals += 1
+
+    if signals == 0:
+        return None
+    return max(-3.0, min(3.0, score / signals))
 
 
 def _baseline_home_rp(
@@ -417,7 +501,7 @@ def _baseline_home_rp(
     gap = away_position - home_position  # positif = home lebih atas
     # Linear interpolation
     base = 0.45  # home advantage
-    base += gap * 0.012  # 1.2% per posisi
+    base += gap * (0.228 / max(league_size - 1, 1))
     return max(0.15, min(0.80, base))
 
 
@@ -489,7 +573,6 @@ def _build_reasoning(
     base_home_rp: float,
     home_position: int | None,
     away_position: int | None,
-    league_size: int,
 ) -> list[str]:
     """3 alasan ringkas berbasis data."""
     reasons: list[str] = []
